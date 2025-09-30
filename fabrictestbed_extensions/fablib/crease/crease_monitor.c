@@ -331,6 +331,122 @@ crinkle_command_handler(
 	}
 }
 
+static inline bool is_tcp_handshake_ack(struct rte_mbuf *m) {
+    struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+    if (rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV4)
+        return true;
+
+    struct rte_ipv4_hdr *ip4 = (struct rte_ipv4_hdr *)(eth + 1);
+    if (ip4->next_proto_id != IPPROTO_TCP)
+        return true;
+
+    const uint8_t  tcp_off  = ip4->ihl * 4;           /* IHL is 4‑byte words   */
+    struct rte_tcp_hdr *tcp = (struct rte_tcp_hdr *)((char *)ip4 + tcp_off);
+
+    fprintf(log_ptr, "TCP Packet\n");
+    fflush(log_ptr);
+
+    uint8_t flags = tcp->tcp_flags;
+
+    fprintf(log_ptr, "SEQ=%" PRIu32 " TCP Flags %d\n", tcp->sent_seq, flags);
+    fflush(log_ptr);
+
+    if (flags == RTE_TCP_SYN_FLAG) {
+        struct syn_key key = {
+            .src_ip = ip4->src_addr,
+            .dst_ip = ip4->dst_addr,
+            .src_port = tcp->src_port,
+            .dst_port = tcp->dst_port,
+            .initial_seq = rte_be_to_cpu_32(tcp->sent_seq)
+        };
+
+        rte_hash_add_key_data(syn_table, &key, (void *)(uintptr_t)1);
+
+        fprintf(log_ptr, "SYN packet recorded, SEQ=%" PRIu32 "\n", key.initial_seq);
+        fflush(log_ptr);
+        
+        return false;
+    }
+    else if (flags == RTE_TCP_ACK_FLAG) {
+        struct syn_key key = {
+            .src_ip = ip4->src_addr,
+            .dst_ip = ip4->dst_addr,
+            .src_port = tcp->src_port,
+            .dst_port = tcp->dst_port,
+            .initial_seq = rte_be_to_cpu_32(tcp->sent_seq) - 1
+        };
+
+        int value;
+        int ret;
+        ret = rte_hash_lookup_data(syn_table, &key, (void**)&value);
+
+        if (ret >= 0) {
+            fprintf(log_ptr, "Matching ACK found, SEQ=%" PRIu32 "\n", key.initial_seq + 1);
+            fflush(log_ptr);
+
+            rte_hash_del_key(syn_table, &key);
+            
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static inline int
+is_icmpv6_routerdisc_or_ns(const struct rte_mbuf *m)
+{
+    const uint8_t *data = rte_pktmbuf_mtod(m, const uint8_t *);
+    const struct rte_ether_hdr *eth;
+    const struct rte_ipv6_hdr *ip6;
+    const struct rte_flow_item_icmp6 *icmp6;
+
+    // L2
+    if (rte_pktmbuf_data_len(m) < sizeof(*eth))
+		return 0;
+
+    eth = (const struct rte_ether_hdr *)data;
+    if (rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV6)
+		return 0;
+
+    // L3
+    const uint8_t *l3 = data + sizeof(*eth);
+    if ((unsigned)(rte_pktmbuf_data_len(m) - sizeof(*eth)) < sizeof(*ip6))
+		return 0;
+
+    ip6 = (const struct rte_ipv6_hdr *)l3;
+    if (ip6->proto != IPPROTO_ICMPV6)
+		return 0;
+
+    if (ip6->hop_limits != 255)
+		return 0; /* ND control packets must use HL=255 per RFC 4861 */
+
+    // L4
+    const uint8_t *l4 = l3 + sizeof(*ip6);
+    if ((unsigned)(rte_pktmbuf_data_len(m) - sizeof(*eth) - sizeof(*ip6)) < sizeof(*icmp6))
+		return 0;
+
+    icmp6 = (const struct rte_flow_item_icmp6 *)l4;
+
+    if (icmp6->code != 0)
+		return 0;
+
+	fprintf(log_ptr, "Is RS/RA/NS/NA\n");
+    fflush(log_ptr);
+	
+    switch (icmp6->type) {
+    case ICMP6_RS:
+    case ICMP6_RA:
+    case ICMP6_NS:
+    case ICMP6_NA:
+        return 1;
+    default:
+		fprintf(log_ptr, "Returning default switch case\n");
+	    fflush(log_ptr);
+        return 0;
+    }
+}
+
 /**
  * This function handles adding (if needed) the custom trailer that stores the packet UID.
  * The UID is formed as:
